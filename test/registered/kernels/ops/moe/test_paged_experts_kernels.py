@@ -1371,34 +1371,117 @@ class TestFusedHostCopyTriton(CustomTestCase):
     setUpClass = classmethod(TestCompactedTritonCalls.setUpClass.__func__)
     _run = TestCompactedTritonCalls._run
 
+    HIDDEN, INTER = 256, 128
+
     def setUp(self):
         torch.manual_seed(0)
-        hidden, inter = 256, 128
-        self.layer = _Layer(
-            {
-                "w13": torch.randn(
-                    E, 2 * inter, hidden, device="cuda", dtype=torch.bfloat16
-                )
-                / 16,
-                "w2": torch.randn(E, hidden, inter, device="cuda", dtype=torch.bfloat16)
-                / 16,
+        self._use("bf16")
+        self.x = torch.randn(4, self.HIDDEN, device="cuda", dtype=torch.bfloat16)
+
+    def _use(self, fmt):
+        """Experts in one of the Triton runner's formats: their tables, and the fused_experts
+        arguments that name them (by slot table)."""
+        h, i = self.HIDDEN, self.INTER
+        w13 = torch.randn(E, 2 * i, h, device="cuda", dtype=torch.bfloat16) / 16
+        w2 = torch.randn(E, h, i, device="cuda", dtype=torch.bfloat16) / 16
+        if fmt == "bf16":
+            tables, quant = {"w13_weight": w13, "w2_weight": w2}, lambda s: {}
+        elif fmt == "bf16 with bias":
+            tables = {
+                "w13_weight": w13,
+                "w2_weight": w2,
+                "w13_weight_bias": torch.randn(
+                    E, 2 * i, device="cuda", dtype=torch.bfloat16
+                ),
+                "w2_weight_bias": torch.randn(
+                    E, h, device="cuda", dtype=torch.bfloat16
+                ),
             }
-        )
-        self.x = torch.randn(4, hidden, device="cuda", dtype=torch.bfloat16)
+            quant = lambda s: dict(b1=s["w13_weight_bias"], b2=s["w2_weight_bias"])
+        elif fmt == "fp8 block":
+            q13, s13 = TestCompactedTritonCalls._fp8_blocks(w13)
+            q2, s2 = TestCompactedTritonCalls._fp8_blocks(w2)
+            tables = {
+                "w13_weight": q13,
+                "w2_weight": q2,
+                "w13_weight_scale": s13,
+                "w2_weight_scale": s2,
+            }
+            quant = lambda s: dict(
+                use_fp8_w8a8=True,
+                w1_scale=s["w13_weight_scale"],
+                w2_scale=s["w2_weight_scale"],
+                block_shape=[128, 128],
+            )
+        elif fmt == "fp8 one scale per expert":
+            tables = {
+                "w13_weight": (w13 * 16).to(torch.float8_e4m3fn),
+                "w2_weight": (w2 * 16).to(torch.float8_e4m3fn),
+                "w13_weight_scale": torch.rand(E, device="cuda") / 16,
+                "w2_weight_scale": torch.rand(E, device="cuda") / 16,
+            }
+            quant = lambda s: dict(
+                use_fp8_w8a8=True,
+                w1_scale=s["w13_weight_scale"],
+                w2_scale=s["w2_weight_scale"],
+            )
+        elif fmt == "int8 block":
+            tables = {
+                "w13_weight": torch.randint(
+                    -128, 128, w13.shape, device="cuda", dtype=torch.int8
+                ),
+                "w2_weight": torch.randint(
+                    -128, 128, w2.shape, device="cuda", dtype=torch.int8
+                ),
+                # One scale per 128 x 128 block of each weight matrix.
+                "w13_weight_scale": torch.rand(E, 2 * i // 128, h // 128, device="cuda")
+                * 1e-2,
+                "w2_weight_scale": torch.rand(E, h // 128, i // 128, device="cuda")
+                * 1e-2,
+            }
+            quant = lambda s: dict(
+                use_int8_w8a8=True,
+                w1_scale=s["w13_weight_scale"],
+                w2_scale=s["w2_weight_scale"],
+                block_shape=[128, 128],
+            )
+        else:  # int8 per-channel, or int8 weights with 16-bit activations
+            tables = {
+                "w13_weight": torch.randint(
+                    -128, 128, w13.shape, device="cuda", dtype=torch.int8
+                ),
+                "w2_weight": torch.randint(
+                    -128, 128, w2.shape, device="cuda", dtype=torch.int8
+                ),
+                "w13_weight_scale": torch.rand(E, 2 * i, device="cuda") * 1e-2,
+                "w2_weight_scale": torch.rand(E, h, device="cuda") * 1e-2,
+            }
+            # W8A8 also quantizes the activations to int8 per token; W8A16 keeps them in bf16.
+            flags = (
+                dict(use_int8_w8a16=True)
+                if fmt == "int8 weights, 16-bit activations"
+                else dict(use_int8_w8a8=True, per_channel_quant=True)
+            )
+            quant = lambda s: dict(
+                flags, w1_scale=s["w13_weight_scale"], w2_scale=s["w2_weight_scale"]
+            )
+        self.layer = _Layer(tables)
+        self.quant = lambda: quant(self.layer.slots)
 
     def _paged_expert_info(self, state):
-        # What PagedExpertsMoEMethod._fuse_host_copy puts on the layer's runner config.
-        w13, w2 = (
-            dict(
-                host_table=self.layer.store.host[n],
-                expert_slot=state.expert_slot,
-                missing_expert_count=state.count,
-            )
-            for n in ("w13", "w2")
-        )
-        paged_expert_info = torch.empty(0, device="cuda")
-        paged_expert_info.info = (w13, w2)
-        return {"paged_expert_info": paged_expert_info}
+        from sglang.srt.layers.moe.paged_experts.method import PagedExpertsMoEMethod
+        from sglang.srt.layers.moe.paged_experts.runners import TRITON
+
+        method = PagedExpertsMoEMethod(None, None, E, K)
+        method.store = self.layer.store
+        method.contract = TRITON
+        method.runner = SimpleNamespace(config=SimpleNamespace())
+        # _set_paged_expert_info reads --enable-torch-compile from the exec config, which kernel
+        # tests do not publish.
+        with patch(f"{PagedExpertsMoEMethod.__module__}.get_exec") as get_exec:
+            get_exec.return_value.graph.enable_torch_compile = False
+            method._set_paged_expert_info(layer=None, residency=state)
+        return {"paged_expert_info": method.runner.config.paged_expert_info}
 
     def _copy_then_compute(self, topk, weights):
         state = _State()
@@ -1407,11 +1490,11 @@ class TestFusedHostCopyTriton(CustomTestCase):
         self.layer.gather(state)
         out = self._run(
             self.x,
-            self.layer.slots["w13"],
-            self.layer.slots["w2"],
+            self.layer.slots["w13_weight"],
+            self.layer.slots["w2_weight"],
             ids.view(topk.shape),
             w.view(topk.shape),
-            {},
+            self.quant(),
         )
         return out, state
 
@@ -1421,11 +1504,11 @@ class TestFusedHostCopyTriton(CustomTestCase):
         self.layer.reset()
         out = self._run(
             self.x,
-            self.layer.slots["w13"],
-            self.layer.slots["w2"],
+            self.layer.slots["w13_weight"],
+            self.layer.slots["w2_weight"],
             ids.view(topk.shape),
             w.view(topk.shape),
-            self._paged_expert_info(state),
+            {**self.quant(), **self._paged_expert_info(state)},
         )
         return out, state
 
@@ -1438,6 +1521,104 @@ class TestFusedHostCopyTriton(CustomTestCase):
                 got, state = self._fused(topk, weights)
                 self.assertTrue(torch.equal(got, want))
                 self.layer.assert_slots_hold(self, state)
+
+    def test_every_format_equals_copy_then_compute_bitwise(self):
+        """The host block copies its columns of the weights, scales and bias into the slot and
+        computes from there. Cases:
+
+        - FP8 block-scaled
+        - FP8 block-scaled with TMA
+        - FP8 block-scaled with swapped operands
+        - FP8 with one scale per expert
+        - INT8 per-channel
+        - BF16 with bias
+        """
+        from sglang.srt.layers.moe.moe_runner.triton_utils import (
+            fused_moe_triton_config,
+        )
+
+        tiles = dict(BLOCK_SIZE_N=128, BLOCK_SIZE_K=128, GROUP_SIZE_M=1)
+        cases = (
+            ("fp8 block", None),
+            ("fp8 block", dict(tiles, BLOCK_SIZE_M=64, USE_TMA=True)),
+            # FP8 with BLOCK_SIZE_M < 64 swaps the kernel's operands (should_enable_swap_ab).
+            ("fp8 block", dict(tiles, BLOCK_SIZE_M=16)),
+            ("fp8 one scale per expert", None),
+            ("int8 per-channel", None),
+            ("bf16 with bias", None),
+        )
+        for fmt, tuned in cases:
+            self._use(fmt)
+            # Not override_config: it cannot ask for TMA in the down launch.
+            found = (
+                patch.object(
+                    fused_moe_triton_config, "get_moe_configs", return_value={4: tuned}
+                )
+                if tuned
+                else contextlib.nullcontext()
+            )
+            for name in ("mixed", "all missing", "one missing expert in every token"):
+                with self.subTest(format=fmt, tuned=tuned, routing=name), found:
+                    topk = torch.tensor(
+                        ROUTINGS[name], dtype=torch.int32, device="cuda"
+                    )
+                    weights = torch.rand(topk.shape, device="cuda")
+                    want, _ = self._copy_then_compute(topk, weights)
+                    got, state = self._fused(topk, weights)
+                    self.assertTrue(torch.equal(got, want))
+                    self.layer.assert_slots_hold(self, state)
+
+    def test_int8_equals_copy_then_compute_bitwise_on_either_tile(self):
+        """INT8 experts on two tiles: the unmodified kernel's default, and the one with a 128-wide
+        loop step that launches paging experts in use by default. Ensure that for a fixed tile
+        selection, that the fused copy kernel matches the result of copy-then-compute bit for bit.
+        Using a different tile can change the accumulation order, which may affect rounding, so
+        runs using different tiles may not match."""
+        from sglang.srt.layers.moe.moe_runner.triton_utils import (
+            fused_moe_triton_config,
+        )
+
+        tokens, top_k = self.x.shape[0], 2
+        for fmt, dtype, block_shape in (
+            ("int8 per-channel", "int8_w8a8", None),
+            ("int8 block", "int8_w8a8", [128, 128]),
+            ("int8 weights, 16-bit activations", "int8_w8a16", None),
+        ):
+            self._use(fmt)
+            for copies_missing_host_experts in (False, True):
+                # What try_get_optimal_moe_config passes for these launches; the slot tables
+                # hold K experts.
+                tile = fused_moe_triton_config.get_default_config(
+                    M=tokens,
+                    E=K,
+                    N=self.INTER,
+                    K=self.HIDDEN,
+                    topk=top_k,
+                    dtype=dtype,
+                    is_marlin=False,
+                    block_shape=block_shape,
+                    copies_missing_host_experts=copies_missing_host_experts,
+                )
+                # Both paths then run this tile, as they would a tuned config.
+                same_tile = patch.object(
+                    fused_moe_triton_config,
+                    "get_moe_configs",
+                    return_value={tokens: tile},
+                )
+                for name in (
+                    "mixed",
+                    "all missing",
+                    "one missing expert in every token",
+                ):
+                    with self.subTest(format=fmt, tile=tile, routing=name), same_tile:
+                        topk = torch.tensor(
+                            ROUTINGS[name], dtype=torch.int32, device="cuda"
+                        )
+                        weights = torch.rand(topk.shape, device="cuda")
+                        want, _ = self._copy_then_compute(topk, weights)
+                        got, state = self._fused(topk, weights)
+                        self.assertTrue(torch.equal(got, want))
+                        self.layer.assert_slots_hold(self, state)
 
     def test_many_tokens_on_one_paged_in_expert(self):
         """32 tokens share expert 50 (missing), so several thread blocks read it from the
@@ -1455,7 +1636,7 @@ class TestFusedHostCopyTriton(CustomTestCase):
         fused_ids = torch.stack([torch.full_like(resident, K + 50), resident], dim=1)
         weights = torch.rand(32, 2, device="cuda")
         x = torch.randn(32, self.x.shape[1], device="cuda", dtype=torch.bfloat16)
-        w13, w2 = self.layer.slots["w13"], self.layer.slots["w2"]
+        w13, w2 = self.layer.slots["w13_weight"], self.layer.slots["w2_weight"]
 
         self.layer.reset()
         self.layer.gather(state)
@@ -1477,8 +1658,8 @@ class TestFusedHostCopyTriton(CustomTestCase):
             ids, w = state.decide(topk.flatten(), weights.flatten(), host_ids=True)
             return self._run(
                 self.x,
-                self.layer.slots["w13"],
-                self.layer.slots["w2"],
+                self.layer.slots["w13_weight"],
+                self.layer.slots["w2_weight"],
                 ids.view(4, 2),
                 w.view(4, 2),
                 paged_expert_info,
@@ -1502,8 +1683,8 @@ class TestFusedHostCopyTriton(CustomTestCase):
             slot_ids = state.expert_slot[topk.long()]
             want = self._run(
                 self.x,
-                self.layer.slots["w13"],
-                self.layer.slots["w2"],
+                self.layer.slots["w13_weight"],
+                self.layer.slots["w2_weight"],
                 slot_ids,
                 weights,
                 {},
@@ -1602,23 +1783,21 @@ class TestFusedHostCopyMarlin(CustomTestCase):
         self.workspace = lambda: marlin_make_workspace(self.x.device, 4)
 
     def _paged_expert_info(self, state):
-        # What PagedExpertsMoEMethod._fuse_host_copy puts on the layer's runner config.
-        ptr = lambda n: paged_experts_host_device_pointer(self.layer.store.host[n])
-        w13, w2 = (
-            dict(
-                host_weight_address=ptr(w),
-                host_scales_address=ptr(f"{w}_scale"),
-                host_global_scale_address=(
-                    ptr(f"{w}_scale_2") if f"{w}_scale_2" in self.layer.slots else 0
-                ),
-                expert_slot=state.expert_slot,
-                missing_expert_count=state.count,
+        from sglang.srt.layers.moe.paged_experts.method import PagedExpertsMoEMethod
+        from sglang.srt.layers.moe.paged_experts.runners import MARLIN
+
+        method = PagedExpertsMoEMethod(None, None, E, K)
+        method.store = self.layer.store
+        method.contract = MARLIN
+        method.runner = SimpleNamespace(config=SimpleNamespace())
+        # _set_paged_expert_info reads --enable-torch-compile from the exec config, which kernel
+        # tests do not publish.
+        with patch(f"{PagedExpertsMoEMethod.__module__}.get_exec") as get_exec:
+            get_exec.return_value.graph.enable_torch_compile = False
+            method._set_paged_expert_info(
+                layer=SimpleNamespace(**self.layer.slots), residency=state
             )
-            for w in ("w13_weight", "w2_weight")
-        )
-        paged_expert_info = torch.empty(0, device="cuda")
-        paged_expert_info.info = (w13, w2)
-        return paged_expert_info
+        return method.runner.config.paged_expert_info
 
     def _run(self, ids, weights, paged_expert_info):
         from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (

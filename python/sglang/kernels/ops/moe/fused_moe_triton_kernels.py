@@ -384,6 +384,8 @@ def fused_moe_kernel(
     # Paged experts, fused host copy (fused_moe_triton_host_copy.py); off without b_host_ptr.
     HOST_IDS_START: tl.constexpr = 0,
     b_host_ptr=None,
+    b_scale_host_ptr=None,
+    bias_host_ptr=None,
     expert_slot_ptr=None,
     missing_expert_count_ptr=None,
 ):
@@ -495,6 +497,11 @@ def fused_moe_kernel(
     if a_desc is not None:
         assert use_fp8_w8a8 and group_n > 0 and group_k > 0
         start_offs_m = pid_m * BLOCK_SIZE_M
+        if b_host_ptr is not None:
+            # Paged experts, fused host copy: matmul_with_host_expert reads A through pointers.
+            a_ptrs = a_ptr + (
+                offs_token_id[:, None] * stride_am + offs_k[None, :] * stride_ak
+            )
     else:
         a_ptrs = a_ptr + (
             offs_token[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak
@@ -510,6 +517,25 @@ def fused_moe_kernel(
             + off_experts * stride_be
             + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
         )
+
+    if b_host_ptr is not None:
+        # Paged experts, fused host copy: for an expert read from host memory, move the bias and
+        # scale pointers so that the reads below land in the host tables.
+        b_scale_slot_ptr = b_scale_ptr
+        # matmul_with_host_expert takes these in every format; the lines below set them for
+        # per-tile scales.
+        a_scale_ptrs = a_scale_ptr
+        b_scale_ptrs = b_scale_ptr
+        if bias_host_ptr is not None:
+            bias_slot_ptr = bias_ptr
+            if off_experts >= HOST_IDS_START:
+                bias_ptr = bias_host_ptr - HOST_IDS_START * stride_bias_e
+        if b_scale_host_ptr is not None:
+            if off_experts >= HOST_IDS_START:
+                if (group_k > 0 and group_n > 0) or per_channel_quant or use_int8_w8a16:
+                    b_scale_ptr = b_scale_host_ptr - HOST_IDS_START * stride_bse
+                else:  # one scale per expert
+                    b_scale_ptr = b_scale_host_ptr - HOST_IDS_START
 
     if bias_ptr is not None:
         bias = tl.load(
@@ -549,6 +575,34 @@ def fused_moe_kernel(
             a_scale = tl.load(a_scale_ptr)
             b_scale = tl.load(b_scale_ptr + off_experts)
 
+    if b_host_ptr is not None:
+        # Paged experts, fused host copy: write what the reads above took from the host tables
+        # into the expert's slot. Per-tile scales are written by matmul_with_host_expert.
+        if bias_host_ptr is not None:
+            if off_experts >= HOST_IDS_START:
+                expert = off_experts - HOST_IDS_START
+                slot = tl.load(expert_slot_ptr + expert).to(tl.int64)
+                tl.store(
+                    bias_slot_ptr
+                    + slot * stride_bias_e
+                    + offs_bn[None, :] * stride_bias_n,
+                    bias,
+                )
+        if b_scale_host_ptr is not None:
+            if group_k == 0 or group_n == 0:
+                if off_experts >= HOST_IDS_START:
+                    expert = off_experts - HOST_IDS_START
+                    slot = tl.load(expert_slot_ptr + expert).to(tl.int64)
+                    if per_channel_quant or use_int8_w8a16:
+                        tl.store(
+                            b_scale_slot_ptr
+                            + slot * stride_bse
+                            + offs_bn[None, :] * stride_bsn,
+                            b_scale,
+                        )
+                    else:  # one scale per expert
+                        tl.store(b_scale_slot_ptr + slot, b_scale)
+
     # -----------------------------------------------------------
     # Iterate to compute a block of the C matrix.
     # We accumulate into a `[BLOCK_SIZE_M, BLOCK_SIZE_N]` block
@@ -575,7 +629,23 @@ def fused_moe_kernel(
             stride_be,
             stride_bk,
             stride_bn,
+            a_scale_ptrs,
+            b_scale_ptrs,
+            b_scale_slot_ptr,
+            pid_n,
+            stride_ask,
+            stride_bse,
+            stride_bsk,
+            stride_bsn,
+            compute_type,
+            group_n,
+            group_k,
+            use_fp8_w8a8,
+            use_int8_w8a8,
+            use_int8_w8a16,
+            swap_ab,
             HOST_IDS_START,
+            BLOCK_SIZE_N,
             BLOCK_SIZE_K,
             even_Ks,
         )
@@ -852,8 +922,9 @@ def invoke_fused_moe_kernel(
     lora_preserve_base: bool = False,
     fuse_swiglu: bool = False,
     a_output_slices: int = 1,
-    # Paged experts, fused host copy (fused_moe_triton_host_copy.py): for B, its experts in
-    # pinned host memory, the layer's expert -> slot table and its count of missing experts.
+    # Paged experts, fused host copy (fused_moe_triton_host_copy.py): for B, B_scale and bias,
+    # their experts in pinned host memory; the layer's expert -> slot table and its count of
+    # missing experts.
     paged_expert_info: Optional[dict] = None,
 ) -> None:
     """Skip inactive experts, including with filter_expert=False.
@@ -1092,12 +1163,8 @@ def invoke_fused_moe_kernel(
         )
         paged_expert_kwargs = {}
         if paged_expert_info is not None:
-            assert not b_use_tma and bias is None and B_scale is None and not swap_ab, (
-                "Paged experts: fused host copy supports only unquantized weights, "
-                "without bias, TMA or swapped operands"
-            )
             paged_expert_kwargs = paged_expert_kernel_kwargs(
-                B=B, paged_expert_info=paged_expert_info
+                B=B, B_scale=B_scale, bias=bias, paged_expert_info=paged_expert_info
             )
         fused_moe_kernel[grid](
             A,

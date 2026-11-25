@@ -186,6 +186,7 @@ def get_default_config(
     dtype: Optional[str],
     is_marlin: bool,
     block_shape: Optional[List[int]] = None,
+    copies_missing_host_experts: bool = False,
 ) -> Dict[str, int]:
     if get_exec().deterministic.enable_deterministic_inference:
         config = {
@@ -258,6 +259,14 @@ def get_default_config(
                 "BLOCK_SIZE_K": 64,
                 "GROUP_SIZE_M": 1,
             }
+            # Paged experts, fused host copy: use a larger tile size for host-read performance,
+            # only if it fits the scale blocks.
+            if (
+                copies_missing_host_experts
+                and dtype in ("int8_w8a8", "int8_w8a16")
+                and (block_shape is None or block_shape[1] % 128 == 0)
+            ):
+                config["BLOCK_SIZE_K"] = 128
     return config
 
 
@@ -271,6 +280,7 @@ def try_get_optimal_moe_config(
     block_shape: Optional[List[int]] = None,
     per_channel_quant: bool = False,
     return_down_config: bool = False,
+    copies_missing_host_experts: bool = False,
 ):
     from sglang.srt.layers.moe.moe_runner.triton_utils import (
         get_config,
@@ -307,7 +317,15 @@ def try_get_optimal_moe_config(
         else:
             # Else use the default config
             config = get_default_config(
-                M, E, N, w1_shape[2], top_k, dtype, is_marlin, block_shape
+                M,
+                E,
+                N,
+                w1_shape[2],
+                top_k,
+                dtype,
+                is_marlin,
+                block_shape,
+                copies_missing_host_experts,
             )
         if return_down_config:
             down_configs = get_moe_configs(

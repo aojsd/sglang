@@ -328,7 +328,7 @@ class PagedExpertsMoEMethod(FusedMoEMethodBase, torch.nn.Module):
             device=getattr(layer, next(iter(self.store.host))).device,
         )
         try:
-            self._fuse_host_copy(layer=layer, residency=residency)
+            self._set_paged_expert_info(layer=layer, residency=residency)
             fused_host_copy = True
         except _FusedHostCopyUnsupported as unsupported:
             fused_host_copy = False
@@ -361,7 +361,7 @@ class PagedExpertsMoEMethod(FusedMoEMethodBase, torch.nn.Module):
         )
         self.executor.fused_host_copy = fused_host_copy
 
-    def _fuse_host_copy(self, layer, residency) -> None:
+    def _set_paged_expert_info(self, layer, residency) -> None:
         """Put the extra arguments of the layer's MoE kernel launches on its runner config, so that
         the kernels page experts in themselves in this layer's device-planned steps."""
         from sglang.srt.layers.moe.moe_runner.triton_utils.moe_align_block_size import (
@@ -384,9 +384,13 @@ class PagedExpertsMoEMethod(FusedMoEMethodBase, torch.nn.Module):
         if get_exec().graph.enable_torch_compile:
             raise _FusedHostCopyUnsupported("--enable-torch-compile")
         if self.contract is TRITON:
-            w13, w2 = self._fuse_host_copy_triton(layer=layer, residency=residency)
+            w13, w2 = self._build_paged_expert_info_triton(
+                layer=layer, residency=residency
+            )
         else:
-            w13, w2 = self._fuse_host_copy_marlin(layer=layer, residency=residency)
+            w13, w2 = self._build_paged_expert_info_marlin(
+                layer=layer, residency=residency
+            )
         # Information of host expert locations and expert slots is stored as a Python attribute,
         # which may be incompatible with torch.compile.
         paged_expert_info = torch.empty(0, device=residency.expert_slot.device)
@@ -398,38 +402,54 @@ class PagedExpertsMoEMethod(FusedMoEMethodBase, torch.nn.Module):
             "their missing experts inside the MoE kernels"
         )
 
-    def _fuse_host_copy_triton(self, layer, residency) -> tuple:
+    def _build_paged_expert_info_triton(self, layer, residency) -> tuple:
         """For w13 and for w2, the launch arguments of ``invoke_fused_moe_kernel``."""
-        from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
-            tuned_moe_configs_use_tma,
-        )
-
-        weights = ("w13_weight", "w2_weight")
-        supported = (torch.bfloat16, torch.float16)
-        biases = _expert_biases(self.store.host)
-        for name, host in self.store.host.items():
-            gpu = getattr(layer, name).data
-            if host[0].numel() == 0 or name in biases:
-                continue
-            if name not in weights or gpu.dim() != 3 or gpu.dtype not in supported:
-                raise _FusedHostCopyUnsupported(
-                    f"{name} ({gpu.dtype}, {gpu.dim()} dimensions) on the triton MoE runner"
-                )
-        _reject_expert_biases(biases)
-        # The MoE kernel reads a host expert through pointers,
-        # which are not supported when using TMA.
-        if tuned_moe_configs_use_tma(layer.w2_weight.data):
-            raise _FusedHostCopyUnsupported("tuned triton MoE configs that use TMA")
-        return tuple(
-            dict(
-                host_table=self.store.host[name],
-                expert_slot=residency.expert_slot,
-                missing_expert_count=residency.count,
+        supported = (torch.bfloat16, torch.float16, torch.float8_e4m3fn, torch.int8)
+        host = {name: t for name, t in self.store.host.items() if t[0].numel()}
+        # The MoE kernels page in only the tensors of their two launches (w13_* and w2_*).
+        others = sorted(name for name in host if not name.startswith(("w13_", "w2_")))
+        if others:
+            raise _FusedHostCopyUnsupported(
+                f"{', '.join(others)} on the triton MoE runner"
             )
-            for name in weights
-        )
+        launches = []
+        for weight in ("w13_weight", "w2_weight"):
+            # Besides its weights, a launch takes one tensor of weight scales and one of biases:
+            # the other paged tensors that start with the weight's prefix ("w13_" or "w2_").
+            prefix = weight.split("_")[0] + "_"
+            biases = [n for n in _expert_biases(host) if n.startswith(prefix)]
+            scales = [
+                n
+                for n in sorted(host)
+                if n.startswith(prefix) and n != weight and n not in biases
+            ]
+            if weight not in host:
+                raise _FusedHostCopyUnsupported(
+                    f"layers that do not page {weight} on the triton MoE runner (this layer "
+                    f"pages {', '.join(sorted(host))})"
+                )
+            if host[weight].dim() != 3 or host[weight].dtype not in supported:
+                raise _FusedHostCopyUnsupported(
+                    f"{weight} ({host[weight].dtype}, {host[weight].dim()} dimensions) on the "
+                    "triton MoE runner"
+                )
+            if len(scales) > 1 or len(biases) > 1:
+                raise _FusedHostCopyUnsupported(
+                    f"{weight} with more than one tensor of scales or biases "
+                    f"({', '.join(scales + biases)}) on the triton MoE runner"
+                )
+            launches.append(
+                dict(
+                    host_table=host[weight],
+                    host_scales_table=host[scales[0]] if scales else None,
+                    host_bias_table=host[biases[0]] if biases else None,
+                    expert_slot=residency.expert_slot,
+                    missing_expert_count=residency.count,
+                )
+            )
+        return tuple(launches)
 
-    def _fuse_host_copy_marlin(self, layer, residency) -> tuple:
+    def _build_paged_expert_info_marlin(self, layer, residency) -> tuple:
         """For w13 and for w2, the launch arguments of ``moe_wna16_marlin_gemm``."""
         from sglang.kernels.ops.moe.paged_experts import (
             paged_experts_host_device_pointer,
